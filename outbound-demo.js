@@ -135,7 +135,11 @@ const makeCall = async (to, task) => {
     const call = await client.calls.create({
         from: PHONE_NUMBER_FROM,
         to,
-        twiml: response.toString()
+        twiml: response.toString(),
+
+        // SAFETY LIMIT:
+        // Force Twilio to end the call after 5 minutes maximum.
+        timeLimit: 300
     });
 
     console.log(
@@ -245,7 +249,18 @@ fastify.register(async (fastify) => {
 
             let sessionRequested = false;
             let sessionReady = false;
+
+            /*
+             * Prevent duplicate cleanup / hangup attempts.
+             */
             let closing = false;
+            let endingTwilioCall = false;
+
+            /*
+             * Becomes true when Twilio itself tells us the stream
+             * ended normally.
+             */
+            let twilioStopReceived = false;
 
             const openAiWs = new WebSocket(
                 'wss://api.openai.com/v1/live/sessions',
@@ -269,6 +284,9 @@ fastify.register(async (fastify) => {
                 }
             };
 
+            /*
+             * Close local WebSocket connections.
+             */
             const close = () => {
                 if (closing) {
                     return;
@@ -304,6 +322,53 @@ fastify.register(async (fastify) => {
                     console.error(
                         'Error closing OpenAI socket:',
                         error
+                    );
+                }
+            };
+
+            /*
+             * IMPORTANT SAFETY FUNCTION
+             *
+             * If the Media Stream or GPT-Live connection dies
+             * unexpectedly, explicitly tell Twilio to terminate
+             * the phone call.
+             *
+             * This protects against a call remaining active
+             * even after the voice WebSocket disappears.
+             */
+            const endTwilioCall = async (reason = 'unknown') => {
+                if (
+                    !callSid ||
+                    endingTwilioCall ||
+                    twilioStopReceived
+                ) {
+                    return;
+                }
+
+                endingTwilioCall = true;
+
+                console.log(
+                    `Force ending Twilio call ${callSid}. Reason: ${reason}`
+                );
+
+                try {
+                    await client
+                        .calls(callSid)
+                        .update({
+                            status: 'completed'
+                        });
+
+                    console.log(
+                        `Twilio call ${callSid} ended successfully.`
+                    );
+                } catch (error) {
+                    /*
+                     * If Twilio already ended the call, the update
+                     * may fail. That is harmless, so log it only.
+                     */
+                    console.error(
+                        'Error force-ending Twilio call:',
+                        error.message
                     );
                 }
             };
@@ -362,6 +427,7 @@ ${callTask || 'لا توجد مهمة محددة.'}
 
                 send({
                     type: 'session.start',
+
                     session: {
                         model: MODEL,
 
@@ -553,6 +619,17 @@ ${callTask || 'لا توجد مهمة محددة.'}
                         else if (
                             data.event === 'stop'
                         ) {
+                            /*
+                             * Twilio says the stream ended normally.
+                             *
+                             * Do NOT send another hangup request here.
+                             */
+                            twilioStopReceived = true;
+
+                            console.log(
+                                'Twilio sent stream stop event.'
+                            );
+
                             close();
                         }
                     } catch (error) {
@@ -564,9 +641,24 @@ ${callTask || 'لا توجد مهمة محددة.'}
                 }
             );
 
+            /*
+             * If Twilio's WebSocket disappears WITHOUT first
+             * sending a normal stop event, explicitly terminate
+             * the Twilio phone call.
+             */
             connection.on(
                 'close',
-                () => {
+                async () => {
+                    console.log(
+                        'Twilio media stream closed.'
+                    );
+
+                    if (!twilioStopReceived) {
+                        await endTwilioCall(
+                            'Twilio media stream closed unexpectedly'
+                        );
+                    }
+
                     close();
 
                     console.log(
@@ -577,24 +669,41 @@ ${callTask || 'لا توجد مهمة محددة.'}
 
             connection.on(
                 'error',
-                (error) => {
+                async (error) => {
                     console.error(
                         'Twilio WebSocket error:',
                         error
+                    );
+
+                    await endTwilioCall(
+                        'Twilio WebSocket error'
                     );
 
                     close();
                 }
             );
 
+            /*
+             * If GPT-Live disconnects unexpectedly while Twilio's
+             * call is still running, explicitly end the phone call.
+             */
             openAiWs.on(
                 'close',
-                (code, reason) => {
+                async (code, reason) => {
                     console.log(
                         'Disconnected from GPT-Live-1',
                         code,
                         reason.toString()
                     );
+
+                    if (
+                        !twilioStopReceived &&
+                        !closing
+                    ) {
+                        await endTwilioCall(
+                            'GPT-Live-1 WebSocket closed'
+                        );
+                    }
 
                     close();
                 }
@@ -602,10 +711,14 @@ ${callTask || 'لا توجد مهمة محددة.'}
 
             openAiWs.on(
                 'error',
-                (error) => {
+                async (error) => {
                     console.error(
                         'Error in OpenAI WebSocket:',
                         error
+                    );
+
+                    await endTwilioCall(
+                        'GPT-Live-1 WebSocket error'
                     );
 
                     close();
