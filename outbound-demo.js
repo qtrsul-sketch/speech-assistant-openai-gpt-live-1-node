@@ -8,24 +8,25 @@ import twilio from 'twilio';
 dotenv.config();
 
 const {
-    OPENAI_API_KEY, TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, PHONE_NUMBER_FROM, DOMAIN
+    OPENAI_API_KEY,
+    TWILIO_ACCOUNT_SID,
+    TWILIO_AUTH_TOKEN,
+    PHONE_NUMBER_FROM,
+    DOMAIN,
+    AGENT_API_KEY
 } = process.env;
 
-if (!OPENAI_API_KEY || !TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !PHONE_NUMBER_FROM || !DOMAIN) {
-    console.error('Missing OPENAI_API_KEY, Twilio credentials, PHONE_NUMBER_FROM, or DOMAIN in the .env file.');
-    process.exit(1);
-}
-
-const TO = process.argv.find((arg) => arg.startsWith('--call='))?.split('=')[1];
-
-if (!TO) {
-    console.error('Usage: node outbound-demo.js --call=+18885551212');
-    process.exit(1);
-}
-
-// Defensive: fail on definitely malformed non-E.164 input before Twilio sees it.
-if (!/^\+[1-9]\d{6,14}$/.test(TO)) {
-    console.error(`--call=${TO} is not an E.164 phone number.`);
+if (
+    !OPENAI_API_KEY ||
+    !TWILIO_ACCOUNT_SID ||
+    !TWILIO_AUTH_TOKEN ||
+    !PHONE_NUMBER_FROM ||
+    !DOMAIN ||
+    !AGENT_API_KEY
+) {
+    console.error(
+        'Missing OPENAI_API_KEY, Twilio credentials, PHONE_NUMBER_FROM, DOMAIN, or AGENT_API_KEY.'
+    );
     process.exit(1);
 }
 
@@ -34,13 +35,15 @@ const DELEGATED_MODEL = 'gpt-5.6-terra';
 const VOICE = 'marin';
 const USER_AGENT = 'twilio-demos/Node 1.0.0';
 const PORT = process.env.PORT || 5050;
-const HOST = DOMAIN.replace(/^https?:\/\//, '').replace(/\/+$/, '');
 
-// Replace the array with business logic to look up if you can call based on jurisdiction.
-const OVERRIDE_NUMBERS = [];
+const HOST = DOMAIN
+    .replace(/^https?:\/\//, '')
+    .replace(/\/+$/, '');
+
+const MAX_TASK_LENGTH = 450;
 
 const OPENING =
-    "السلام عليكم، معك المساعد الصوتي بالذكاء الاصطناعي الخاص بسلطان. كيف أقدر أخدمك؟";
+    'السلام عليكم، معك المساعد الصوتي بالذكاء الاصطناعي الخاص بسلطان.';
 
 const VOICE_PROMPT = `
 أنت المساعد الصوتي الشخصي الخاص بسلطان.
@@ -50,182 +53,590 @@ const VOICE_PROMPT = `
 لا تتحدث بالإنجليزية إلا إذا طلب الطرف الآخر ذلك.
 
 تحدث بسرعة محادثة طبيعية ولا تطل في الرد.
-تفاعل فوراً عندما يتوقف الطرف الآخر عن الكلام.
+تفاعل بسرعة عندما يتوقف الطرف الآخر عن الكلام.
+
 إذا قاطعك الطرف الآخر أثناء كلامك، توقف واستمع له ثم أكمل بناءً على كلامه.
 
 أنت مساعد صوتي بالذكاء الاصطناعي يعمل بالنيابة عن سلطان.
-لا تدّع أنك سلطان ولا تدّع أنك إنسان.
+لا تدّع أنك سلطان.
+ولا تدّع أنك إنسان إذا تم سؤالك مباشرة.
 
-إذا كانت لديك مهمة محددة في المكالمة، ركز على إنجازها.
-إذا لم تفهم الكلام، اطلب من الطرف الآخر إعادة الجملة باختصار.
+لكل مكالمة قد تكون هناك مهمة محددة.
+ركز على تنفيذ المهمة الحالية ولا تخرج عنها بدون حاجة.
 
+إذا كنت تتصل بمطعم أو شركة أو شخص لتنفيذ طلب، عرّف بنفسك باختصار ثم ابدأ في تنفيذ المهمة بشكل طبيعي.
+
+إذا لم تفهم كلام الطرف الآخر، اطلب منه إعادة الكلام باختصار.
+
+لا تخترع معلومات غير موجودة.
 لا توافق على أي دفع أو التزام مالي بدون موافقة صريحة من سلطان.
-ولا تؤكد حجزاً أو موعداً إلا بعد التأكد من تفاصيله.
+لا تؤكد حجزاً أو موعداً إلا بعد التأكد من التاريخ والوقت والتفاصيل.
+
+إذا لم يكن الخيار المطلوب متوفراً، يمكنك السؤال عن البدائل المناسبة، لكن لا توافق على تغيير جوهري بدون الرجوع إلى سلطان.
 `;
 
 const BACKEND_PROMPT = `
-ساعد المساعد الصوتي في تنفيذ مهامه بدقة.
-أجب بالعربية وباختصار.
-لا تخترع معلومات غير مؤكدة.
-إذا كانت هناك حاجة إلى أداة أو معلومة خارجية، استخدم الأداة المناسبة.
+أنت العقل الخلفي للمساعد الصوتي الخاص بسلطان.
+
+ساعد المساعد الصوتي على تنفيذ المهمة الحالية بدقة.
+استخدم المعلومات المتاحة فقط.
+لا تخترع معلومات أو تفاصيل غير مؤكدة.
+
+إذا كانت هناك حاجة إلى البحث عن معلومة عامة متاحة على الإنترنت، استخدم أداة البحث عند الحاجة.
+
+أجب بالعربية وباختصار لأن النتيجة ستستخدم أثناء مكالمة هاتفية.
+
+لا توافق على دفع أو التزام مالي بالنيابة عن سلطان بدون موافقته الصريحة.
 `;
+
 const TOOLS = [
-    { type: 'web_search' },
     {
-        type: 'function',
-        name: 'get_callback_reason',
-        description: 'Look up the note attached to this callback.',
-        parameters: { type: 'object', properties: {}, additionalProperties: false }
+        type: 'web_search'
     }
 ];
 
-const NOTES = [
-    'Your flight is on time. I checked twice. I will check again.',
-    'Your table is ready, and I told them you prefer the booth by the window.',
-    'Your package arrives Thursday. The driver has been briefed about the driveway.',
-    'Your prescription is ready, along with a 17-inch-long receipt.',
-    'Your appointment moved up an hour, which I spotted an hour before they called you. '
-        + 'I asked them to send you a reminder and a reminder about the reminder, to be safe.',
-    'Your order shipped, and I have been refreshing the tracking page on your behalf.',
-];
+const client = twilio(
+    TWILIO_ACCOUNT_SID,
+    TWILIO_AUTH_TOKEN
+);
 
-// Mock tool call, slow on purpose.
-const getCallbackReason = async () => {
-    console.log("Consulting Owlie's notes...");
-    await new Promise((resolve) => setTimeout(resolve, 2000));
-    return { note: NOTES[Math.floor(Math.random() * NOTES.length)] };
-};
-
-const client = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
-
-const makeCall = async (to) => {
-    if (!OVERRIDE_NUMBERS.includes(to)) {
-        const [owned, verified] = await Promise.all([
-            client.incomingPhoneNumbers.list({ phoneNumber: to }),
-            client.outgoingCallerIds.list({ phoneNumber: to })
-        ]);
-        if (!owned.length && !verified.length) {
-            console.error(`${to} is not a Twilio number on this account or a verified caller ID.`);
-            process.exit(1);
-        }
+const makeCall = async (to, task) => {
+    if (!/^\+[1-9]\d{6,14}$/.test(to)) {
+        throw new Error(
+            'Invalid phone number. Use E.164 format, for example +974XXXXXXXX.'
+        );
     }
+
+    if (!task || typeof task !== 'string' || !task.trim()) {
+        throw new Error('Task is required.');
+    }
+
+    const cleanTask = task.trim();
+
+    if (cleanTask.length > MAX_TASK_LENGTH) {
+        throw new Error(
+            `Task is too long. Maximum length is ${MAX_TASK_LENGTH} characters.`
+        );
+    }
+
+    const response = new twilio.twiml.VoiceResponse();
+
+    const connect = response.connect();
+
+    const stream = connect.stream({
+        url: `wss://${HOST}/media-stream`
+    });
+
+    stream.parameter({
+        name: 'task',
+        value: cleanTask
+    });
 
     const call = await client.calls.create({
         from: PHONE_NUMBER_FROM,
         to,
-        twiml: `<Response><Connect><Stream url="wss://${HOST}/media-stream" /></Connect></Response>`
+        twiml: response.toString()
     });
-    console.log(`Returning ${to}'s call — ${call.sid}`);
+
+    console.log(
+        `Started outbound call to ${to} — ${call.sid}`
+    );
+
+    return call;
 };
 
 const fastify = Fastify();
+
 fastify.register(fastifyFormBody);
 fastify.register(fastifyWs);
 
+/*
+ * Simple health check.
+ */
+fastify.get('/health', async () => {
+    return {
+        ok: true,
+        service: 'Sultan Voice Agent'
+    };
+});
+
+/*
+ * API used by n8n to start a phone call.
+ *
+ * POST /api/call
+ *
+ * Header:
+ * x-agent-key: YOUR_AGENT_API_KEY
+ *
+ * Body:
+ * {
+ *   "phoneNumber": "+974XXXXXXXX",
+ *   "task": "المهمة المطلوبة"
+ * }
+ */
+fastify.post('/api/call', async (request, reply) => {
+    const apiKey = request.headers['x-agent-key'];
+
+    if (apiKey !== AGENT_API_KEY) {
+        return reply.code(401).send({
+            success: false,
+            error: 'Unauthorized'
+        });
+    }
+
+    const {
+        phoneNumber,
+        task
+    } = request.body || {};
+
+    if (!phoneNumber) {
+        return reply.code(400).send({
+            success: false,
+            error: 'phoneNumber is required'
+        });
+    }
+
+    if (!task) {
+        return reply.code(400).send({
+            success: false,
+            error: 'task is required'
+        });
+    }
+
+    try {
+        const call = await makeCall(
+            phoneNumber,
+            task
+        );
+
+        return reply.code(200).send({
+            success: true,
+            callSid: call.sid,
+            status: call.status || 'queued',
+            phoneNumber
+        });
+    } catch (error) {
+        console.error(
+            'Error starting outbound call:',
+            error
+        );
+
+        return reply.code(500).send({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
 fastify.register(async (fastify) => {
-    fastify.get('/media-stream', { websocket: true }, (connection) => {
-        console.log('Call answered, media stream connected');
+    fastify.get(
+        '/media-stream',
+        {
+            websocket: true
+        },
+        (connection) => {
+            console.log(
+                'Call answered, media stream connected'
+            );
 
-        let streamSid = null;
-        let sessionRequested = false;
-        let sessionReady = false;
+            let streamSid = null;
+            let callSid = null;
+            let callTask = '';
 
-        const openAiWs = new WebSocket('wss://api.openai.com/v1/live/sessions', {
-            headers: {
-                Authorization: `Bearer ${OPENAI_API_KEY}`,
-                'User-Agent': USER_AGENT
-            }
-        });
+            let sessionRequested = false;
+            let sessionReady = false;
+            let closing = false;
 
-        const send = (event) => {
-            if (openAiWs.readyState === WebSocket.OPEN) openAiWs.send(JSON.stringify(event));
-        };
-        const close = () => {
-            sessionReady = false;
-            connection.close();
-            openAiWs.close();
-        };
-
-        // Wait for Twilio's stream ID before starting the session.
-        const startSession = () => {
-            if (sessionRequested || !streamSid || openAiWs.readyState !== WebSocket.OPEN) return;
-            sessionRequested = true;
-            send({ type: 'session.start', session: {
-                model: MODEL,
-                instructions: VOICE_PROMPT,
-                audio: { format: { type: 'audio/pcmu', rate: 8000 }, output: { voice: VOICE } },
-                delegation: {
-                    type: 'responses',
-                    responses: { model: DELEGATED_MODEL, instructions: BACKEND_PROMPT, tools: TOOLS }
+            const openAiWs = new WebSocket(
+                'wss://api.openai.com/v1/live/sessions',
+                {
+                    headers: {
+                        Authorization:
+                            `Bearer ${OPENAI_API_KEY}`,
+                        'User-Agent': USER_AGENT
+                    }
                 }
-            } });
-        };
+            );
 
-        openAiWs.on('open', () => {
-            console.log('Connected to GPT-Live-1');
-            startSession();
-        });
-
-        openAiWs.on('message', async (data) => {
-            try {
-                const event = JSON.parse(data);
-
-                if (event.type === 'session.started') {
-                    sessionReady = true;
-                    // Quote this ID if you ever need OpenAI's help with a call.
-                    console.log('GPT-Live-1 session', event.session?.id);
-                    send({ type: 'session.instructions.append', delegation_id: null,
-                        content: `Your first spoken line on this call is, verbatim: "${OPENING}"` });
-                    send({ type: 'session.commentary.append', delegation_id: null, content: OPENING });
-                } else if (event.type === 'session.output_audio.delta' && streamSid && connection.readyState === WebSocket.OPEN) {
-                    connection.send(JSON.stringify({ event: 'media', streamSid, media: { payload: event.delta } }));
-                } else if (event.type === 'response.event'
-                    && event.event?.type === 'response.output_item.done'
-                    && event.event.item?.type === 'function_call' && event.event.item.status === 'completed') {
-                    const { call_id, name, arguments: args } = event.event.item;
-                    console.log('Tool call:', name, args);
-                    const output = name === 'get_callback_reason'
-                        ? await getCallbackReason()
-                        : { error: 'unknown tool' };
-                    send({ type: 'response.item.create',
-                        item: { type: 'function_call_output', call_id, output: JSON.stringify(output) } });
-                    send({ type: 'response.create' });
-                } else if (event.type === 'session.output_transcript.delta') {
-                    console.log('Assistant:', event.delta);
-                } else if (event.type === 'error') {
-                    console.error('GPT-Live-1 error:', event.error);
+            const send = (event) => {
+                if (
+                    openAiWs.readyState ===
+                    WebSocket.OPEN
+                ) {
+                    openAiWs.send(
+                        JSON.stringify(event)
+                    );
                 }
-            } catch (error) { console.error('Error processing the GPT-Live-1 message:', error); }
-        });
+            };
 
-        connection.on('message', (message) => {
-            try {
-                const data = JSON.parse(message);
+            const close = () => {
+                if (closing) {
+                    return;
+                }
 
-                if (data.event === 'media' && sessionReady && openAiWs.readyState === WebSocket.OPEN) {
-                    send({ type: 'session.input_audio.append', audio: data.media.payload });
-                } else if (data.event === 'start') {
-                    streamSid = data.start.streamSid;
-                    console.log('Outgoing stream has started', streamSid);
-                    startSession();
-                } else if (data.event === 'stop') {
+                closing = true;
+                sessionReady = false;
+
+                try {
+                    if (
+                        connection.readyState ===
+                        WebSocket.OPEN
+                    ) {
+                        connection.close();
+                    }
+                } catch (error) {
+                    console.error(
+                        'Error closing Twilio socket:',
+                        error
+                    );
+                }
+
+                try {
+                    if (
+                        openAiWs.readyState ===
+                        WebSocket.OPEN ||
+                        openAiWs.readyState ===
+                        WebSocket.CONNECTING
+                    ) {
+                        openAiWs.close();
+                    }
+                } catch (error) {
+                    console.error(
+                        'Error closing OpenAI socket:',
+                        error
+                    );
+                }
+            };
+
+            /*
+             * Wait until:
+             * 1. Twilio has supplied streamSid
+             * 2. We have received the task
+             * 3. OpenAI WebSocket is connected
+             */
+            const startSession = () => {
+                if (
+                    sessionRequested ||
+                    !streamSid ||
+                    openAiWs.readyState !==
+                        WebSocket.OPEN
+                ) {
+                    return;
+                }
+
+                sessionRequested = true;
+
+                const taskInstructions = callTask
+                    ? `
+المهمة الحالية في هذه المكالمة:
+
+${callTask}
+
+نفذ هذه المهمة أثناء المكالمة.
+
+ابدأ بالتعريف بنفسك باختصار ثم انتقل مباشرة إلى سبب الاتصال.
+
+لا تسأل الطرف الآخر "كيف أقدر أخدمك؟" لأنك أنت من أجريت الاتصال لتنفيذ مهمة محددة.
+
+إذا أعطاك الطرف الآخر نتيجة أو تأكيداً، تأكد من التفاصيل المهمة قبل إنهاء المكالمة.
+
+إذا احتاج الأمر إلى دفع أو التزام مالي أو تغيير جوهري عن المطلوب، لا توافق عليه بدون موافقة سلطان.
+`
+                    : `
+لا توجد مهمة محددة لهذه المكالمة.
+تحدث بشكل طبيعي مع الطرف الآخر.
+`;
+
+                const liveInstructions = `
+${VOICE_PROMPT}
+
+${taskInstructions}
+`;
+
+                const backendInstructions = `
+${BACKEND_PROMPT}
+
+المهمة الحالية للمكالمة:
+${callTask || 'لا توجد مهمة محددة.'}
+`;
+
+                send({
+                    type: 'session.start',
+                    session: {
+                        model: MODEL,
+
+                        instructions:
+                            liveInstructions,
+
+                        audio: {
+                            format: {
+                                type: 'audio/pcmu',
+                                rate: 8000
+                            },
+
+                            output: {
+                                voice: VOICE
+                            }
+                        },
+
+                        delegation: {
+                            type: 'responses',
+
+                            responses: {
+                                model:
+                                    DELEGATED_MODEL,
+
+                                instructions:
+                                    backendInstructions,
+
+                                tools: TOOLS
+                            }
+                        }
+                    }
+                });
+            };
+
+            openAiWs.on('open', () => {
+                console.log(
+                    'Connected to GPT-Live-1'
+                );
+
+                startSession();
+            });
+
+            openAiWs.on(
+                'message',
+                async (rawData) => {
+                    try {
+                        const event = JSON.parse(
+                            rawData.toString()
+                        );
+
+                        if (
+                            event.type ===
+                            'session.started'
+                        ) {
+                            sessionReady = true;
+
+                            console.log(
+                                'GPT-Live-1 session',
+                                event.session?.id
+                            );
+
+                            send({
+                                type:
+                                    'session.instructions.append',
+
+                                delegation_id: null,
+
+                                content:
+                                    `الجملة الأولى التي تقولها في هذه المكالمة حرفياً هي: "${OPENING}"`
+                            });
+
+                            send({
+                                type:
+                                    'session.commentary.append',
+
+                                delegation_id: null,
+
+                                content: OPENING
+                            });
+                        }
+
+                        else if (
+                            event.type ===
+                                'session.output_audio.delta' &&
+                            streamSid &&
+                            connection.readyState ===
+                                WebSocket.OPEN
+                        ) {
+                            connection.send(
+                                JSON.stringify({
+                                    event: 'media',
+                                    streamSid,
+
+                                    media: {
+                                        payload:
+                                            event.delta
+                                    }
+                                })
+                            );
+                        }
+
+                        else if (
+                            event.type ===
+                            'session.output_transcript.delta'
+                        ) {
+                            console.log(
+                                'Assistant:',
+                                event.delta
+                            );
+                        }
+
+                        else if (
+                            event.type === 'error'
+                        ) {
+                            console.error(
+                                'GPT-Live-1 error:',
+                                event.error
+                            );
+                        }
+                    } catch (error) {
+                        console.error(
+                            'Error processing GPT-Live-1 message:',
+                            error
+                        );
+                    }
+                }
+            );
+
+            connection.on(
+                'message',
+                (rawMessage) => {
+                    try {
+                        const data = JSON.parse(
+                            rawMessage.toString()
+                        );
+
+                        if (
+                            data.event === 'start'
+                        ) {
+                            streamSid =
+                                data.start.streamSid;
+
+                            callSid =
+                                data.start.callSid ||
+                                null;
+
+                            callTask =
+                                data.start
+                                    .customParameters
+                                    ?.task || '';
+
+                            console.log(
+                                'Outgoing stream has started',
+                                streamSid
+                            );
+
+                            if (callSid) {
+                                console.log(
+                                    'Twilio call:',
+                                    callSid
+                                );
+                            }
+
+                            console.log(
+                                'Task received:',
+                                callTask
+                                    ? 'yes'
+                                    : 'no'
+                            );
+
+                            startSession();
+                        }
+
+                        else if (
+                            data.event === 'media' &&
+                            sessionReady &&
+                            openAiWs.readyState ===
+                                WebSocket.OPEN
+                        ) {
+                            send({
+                                type:
+                                    'session.input_audio.append',
+
+                                audio:
+                                    data.media.payload
+                            });
+                        }
+
+                        else if (
+                            data.event === 'stop'
+                        ) {
+                            close();
+                        }
+                    } catch (error) {
+                        console.error(
+                            'Error parsing Twilio message:',
+                            error
+                        );
+                    }
+                }
+            );
+
+            connection.on(
+                'close',
+                () => {
+                    close();
+
+                    console.log(
+                        'Call ended.'
+                    );
+                }
+            );
+
+            connection.on(
+                'error',
+                (error) => {
+                    console.error(
+                        'Twilio WebSocket error:',
+                        error
+                    );
+
                     close();
                 }
-            } catch (error) { console.error('Error parsing Twilio message:', error); }
-        });
+            );
 
-        connection.on('close', () => { close(); console.log('Call ended.'); });
-        connection.on('error', close);
-        openAiWs.on('close', (code, reason) => {
-            close();
-            console.log('Disconnected from GPT-Live-1', code, reason.toString());
-        });
-        openAiWs.on('error', (error) => { console.error('Error in the OpenAI WebSocket:', error); close(); });
-    });
+            openAiWs.on(
+                'close',
+                (code, reason) => {
+                    console.log(
+                        'Disconnected from GPT-Live-1',
+                        code,
+                        reason.toString()
+                    );
+
+                    close();
+                }
+            );
+
+            openAiWs.on(
+                'error',
+                (error) => {
+                    console.error(
+                        'Error in OpenAI WebSocket:',
+                        error
+                    );
+
+                    close();
+                }
+            );
+        }
+    );
 });
 
-fastify.listen({ port: PORT, host: "::" }, async (err) => {
-    if (err) { console.error(err); process.exit(1); }
-    console.log(`Server is listening on port ${PORT}`);
-    await makeCall(TO);
-});
+/*
+ * Start the service.
+ * It will NOT make a call automatically.
+ * It waits for POST /api/call.
+ */
+fastify.listen(
+    {
+        port: PORT,
+        host: '::'
+    },
+    (err) => {
+        if (err) {
+            console.error(err);
+            process.exit(1);
+        }
+
+        console.log(
+            `Server is listening on port ${PORT}`
+        );
+
+        console.log(
+            'Waiting for /api/call requests...'
+        );
+    }
+);
